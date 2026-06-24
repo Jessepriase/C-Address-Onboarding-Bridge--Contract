@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Vec,
+    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Map, Vec,
 };
 
 #[contracterror]
@@ -16,6 +16,7 @@ pub enum BridgeError {
     AddressBlocked = 7,
     AddressNotAllowlisted = 8,
     InsufficientReclaimable = 9,
+    AssetNotWhitelisted = 10,
 }
 
 #[contracttype]
@@ -29,6 +30,7 @@ pub enum DataKey {
     Allowlisted(Address),
     AllowlistMode,
     AccruedFees(Address),
+    AssetWhitelist,
 }
 
 const MAX_FEE_BPS: u32 = 1_000;
@@ -125,6 +127,26 @@ fn check_access(env: &Env, target: &Address) -> Result<(), BridgeError> {
     Ok(())
 }
 
+fn read_whitelist(env: &Env) -> Map<Address, bool> {
+    env.storage()
+        .instance()
+        .get(&DataKey::AssetWhitelist)
+        .unwrap_or_else(|| Map::new(env))
+}
+
+fn save_whitelist(env: &Env, whitelist: &Map<Address, bool>) {
+    env.storage()
+        .instance()
+        .set(&DataKey::AssetWhitelist, whitelist);
+}
+
+fn check_asset_whitelisted(env: &Env, asset: &Address) -> Result<(), BridgeError> {
+    if !read_whitelist(env).get(asset.clone()).unwrap_or(false) {
+        return Err(BridgeError::AssetNotWhitelisted);
+    }
+    Ok(())
+}
+
 fn read_accrued_fees(env: &Env, asset: &Address) -> i128 {
     env.storage()
         .persistent()
@@ -184,6 +206,7 @@ impl OnboardingBridge {
             return Err(BridgeError::InvalidAmount);
         }
         check_access(&env, &target)?;
+        check_asset_whitelisted(&env, &asset)?;
         source.require_auth();
 
         let token_client = token::Client::new(&env, &asset);
@@ -218,6 +241,7 @@ impl OnboardingBridge {
         if targets.len() == 0 {
             return Ok(());
         }
+        check_asset_whitelisted(&env, &asset)?;
         source.require_auth();
 
         let mut total: i128 = 0;
@@ -450,6 +474,38 @@ impl OnboardingBridge {
         env.events()
             .publish(("TokensReclaimed", admin, asset), (amount, destination));
         Ok(())
+    }
+
+    // --- Asset Whitelist ---
+
+    pub fn add_asset(env: Env, asset: Address) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        let mut whitelist = read_whitelist(&env);
+        whitelist.set(asset, true);
+        save_whitelist(&env, &whitelist);
+        Ok(())
+    }
+
+    pub fn remove_asset(env: Env, asset: Address) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        let mut whitelist = read_whitelist(&env);
+        whitelist.remove(asset);
+        save_whitelist(&env, &whitelist);
+        Ok(())
+    }
+
+    pub fn query_is_asset_whitelisted(env: Env, asset: Address) -> Result<bool, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_whitelist(&env).get(asset).unwrap_or(false))
+    }
+
+    pub fn query_whitelisted_assets(env: Env) -> Result<Vec<Address>, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_whitelist(&env).keys())
     }
 }
 

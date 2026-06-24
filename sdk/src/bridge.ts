@@ -15,7 +15,6 @@ import {
   scValToNative,
   TransactionBuilder,
   BASE_FEE,
-  Networks,
 } from '@stellar/stellar-sdk';
 
 export class OnboardingBridgeSDK {
@@ -67,7 +66,7 @@ export class OnboardingBridgeSDK {
 
       return {
         hash: response.hash,
-        status: response.status === 'ERROR' ? 'failed' : 'pending',
+        status: response.status === 'PENDING' ? 'success' : 'pending',
       };
     } catch (error: any) {
       return {
@@ -113,7 +112,7 @@ export class OnboardingBridgeSDK {
 
       return {
         hash: response.hash,
-        status: response.status === 'ERROR' ? 'failed' : 'pending',
+        status: response.status === 'PENDING' ? 'success' : 'pending',
       };
     } catch (error: any) {
       return {
@@ -157,7 +156,7 @@ export class OnboardingBridgeSDK {
 
       return {
         hash: response.hash,
-        status: response.status === 'ERROR' ? 'failed' : 'pending',
+        status: response.status === 'PENDING' ? 'success' : 'pending',
       };
     } catch (error: any) {
       return {
@@ -177,11 +176,11 @@ export class OnboardingBridgeSDK {
         this.buildSimulationTx('query_fee_bps', []),
       );
 
-    if ('error' in result && result.error) {
+    if (SorobanRpc.Api.isSimulationError(result)) {
       throw new Error(`Failed to get fee: ${result.error}`);
     }
 
-    const scVal = (result as any).results?.[0]?.retval;
+    const scVal = result.result?.retval;
     return scVal ? Number(scValToNative(scVal)) : 0;
   }
 
@@ -194,11 +193,11 @@ export class OnboardingBridgeSDK {
         this.buildSimulationTx('query_fee_collector', []),
       );
 
-    if ('error' in result && result.error) {
+    if (SorobanRpc.Api.isSimulationError(result)) {
       throw new Error(`Failed to get fee collector: ${result.error}`);
     }
 
-    const scVal = (result as any).results?.[0]?.retval;
+    const scVal = result.result?.retval;
     return scVal ? scValToNative(scVal).toString() : '';
   }
 
@@ -211,11 +210,11 @@ export class OnboardingBridgeSDK {
         this.buildSimulationTx('query_admin', []),
       );
 
-    if ('error' in result && result.error) {
+    if (SorobanRpc.Api.isSimulationError(result)) {
       throw new Error(`Failed to get admin: ${result.error}`);
     }
 
-    const scVal = (result as any).results?.[0]?.retval;
+    const scVal = result.result?.retval;
     return scVal ? scValToNative(scVal).toString() : '';
   }
 
@@ -231,11 +230,11 @@ export class OnboardingBridgeSDK {
         this.buildSimulationTx('query_balance', [cAddress, asset]),
       );
 
-    if ('error' in result && result.error) {
+    if (SorobanRpc.Api.isSimulationError(result)) {
       throw new Error(`Failed to get balance: ${result.error}`);
     }
 
-    const scVal = (result as any).results?.[0]?.retval;
+    const scVal = result.result?.retval;
     return scVal ? scValToNative(scVal).toString() : '0';
   }
 
@@ -248,11 +247,11 @@ export class OnboardingBridgeSDK {
         this.buildSimulationTx('query_is_initialized', []),
       );
 
-    if ('error' in result && result.error) {
+    if (SorobanRpc.Api.isSimulationError(result)) {
       throw new Error(`Failed to check initialization: ${result.error}`);
     }
 
-    const scVal = (result as any).results?.[0]?.retval;
+    const scVal = result.result?.retval;
     return scVal ? Boolean(scValToNative(scVal)) : false;
   }
 
@@ -288,7 +287,7 @@ export class OnboardingBridgeSDK {
 
       return {
         hash: response.hash,
-        status: response.status === 'ERROR' ? 'failed' : 'pending',
+        status: response.status === 'PENDING' ? 'success' : 'pending',
       };
     } catch (error: any) {
       return {
@@ -331,7 +330,7 @@ export class OnboardingBridgeSDK {
 
       return {
         hash: response.hash,
-        status: response.status === 'ERROR' ? 'failed' : 'pending',
+        status: response.status === 'PENDING' ? 'success' : 'pending',
       };
     } catch (error: any) {
       return {
@@ -374,7 +373,7 @@ export class OnboardingBridgeSDK {
 
       return {
         hash: response.hash,
-        status: response.status === 'ERROR' ? 'failed' : 'pending',
+        status: response.status === 'PENDING' ? 'success' : 'pending',
       };
     } catch (error: any) {
       return {

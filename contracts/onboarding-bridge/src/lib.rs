@@ -31,6 +31,8 @@ pub enum DataKey {
     AllowlistMode,
     AccruedFees(Address),
     AssetWhitelist,
+    TotalBridged(Address),
+    TotalFeesCollected(Address),
 }
 
 const MAX_FEE_BPS: u32 = 1_000;
@@ -177,6 +179,34 @@ fn decrement_accrued_fees(env: &Env, asset: &Address, amount: i128) {
         .set(&DataKey::AccruedFees(asset.clone()), &(current - amount));
 }
 
+fn read_total_bridged(env: &Env, asset: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::TotalBridged(asset.clone()))
+        .unwrap_or(0)
+}
+
+fn increment_total_bridged(env: &Env, asset: &Address, amount: i128) {
+    let current = read_total_bridged(env, asset);
+    env.storage()
+        .persistent()
+        .set(&DataKey::TotalBridged(asset.clone()), &(current + amount));
+}
+
+fn read_total_fees_collected(env: &Env, asset: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::TotalFeesCollected(asset.clone()))
+        .unwrap_or(0)
+}
+
+fn increment_total_fees_collected(env: &Env, asset: &Address, amount: i128) {
+    let current = read_total_fees_collected(env, asset);
+    env.storage()
+        .persistent()
+        .set(&DataKey::TotalFeesCollected(asset.clone()), &(current + amount));
+}
+
 #[contract]
 pub struct OnboardingBridge;
 
@@ -230,6 +260,8 @@ impl OnboardingBridge {
         }
 
         increment_accrued_fees(&env, &asset, fee);
+        increment_total_bridged(&env, &asset, net_amount);
+        increment_total_fees_collected(&env, &asset, fee);
         env.events()
             .publish(("CAddressFunded", source, target), (amount, fee, asset));
         Ok(())
@@ -280,6 +312,8 @@ impl OnboardingBridge {
             }
 
             increment_accrued_fees(&env, &asset, fee);
+            increment_total_bridged(&env, &asset, net_amount);
+            increment_total_fees_collected(&env, &asset, fee);
             env.events().publish(
                 ("CAddressFunded", source.clone(), target),
                 (amount, fee, asset.clone()),
@@ -387,6 +421,16 @@ impl OnboardingBridge {
         let fee = calculate_fee(gross_amount, fee_bps);
         let net = gross_amount - fee;
         (fee, net)
+    }
+
+    pub fn query_total_bridged(env: Env, asset: Address) -> Result<i128, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_total_bridged(&env, &asset))
+    }
+
+    pub fn query_total_fees_collected(env: Env, asset: Address) -> Result<i128, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_total_fees_collected(&env, &asset))
     }
 
     pub fn pause(env: Env) -> Result<(), BridgeError> {

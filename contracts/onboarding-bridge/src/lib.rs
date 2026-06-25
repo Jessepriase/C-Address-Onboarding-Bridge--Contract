@@ -13,6 +13,8 @@ pub enum BridgeError {
     FeeTooHigh = 4,
     MismatchedArrays = 5,
     ContractPaused = 6,
+    AddressBlocked = 7,
+    AddressNotAllowlisted = 8,
 }
 
 #[contracttype]
@@ -22,6 +24,9 @@ pub enum DataKey {
     FeeBps,
     Initialized,
     Paused,
+    Blocked(Address),
+    Allowlisted(Address),
+    AllowlistMode,
 }
 
 const MAX_FEE_BPS: u32 = 1_000;
@@ -87,6 +92,37 @@ fn calculate_fee(amount: i128, fee_bps: u32) -> i128 {
     (amount * fee_bps as i128) / FEE_DENOMINATOR
 }
 
+fn is_blocked(env: &Env, addr: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Blocked(addr.clone()))
+        .unwrap_or(false)
+}
+
+fn is_allowlisted(env: &Env, addr: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Allowlisted(addr.clone()))
+        .unwrap_or(false)
+}
+
+fn allowlist_mode(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::AllowlistMode)
+        .unwrap_or(false)
+}
+
+fn check_access(env: &Env, target: &Address) -> Result<(), BridgeError> {
+    if is_blocked(env, target) {
+        return Err(BridgeError::AddressBlocked);
+    }
+    if allowlist_mode(env) && !is_allowlisted(env, target) {
+        return Err(BridgeError::AddressNotAllowlisted);
+    }
+    Ok(())
+}
+
 #[contract]
 pub struct OnboardingBridge;
 
@@ -124,6 +160,7 @@ impl OnboardingBridge {
         if amount <= 0 {
             return Err(BridgeError::InvalidAmount);
         }
+        check_access(&env, &target)?;
         source.require_auth();
 
         let token_client = token::Client::new(&env, &asset);
@@ -177,6 +214,7 @@ impl OnboardingBridge {
         for i in 0..targets.len() {
             let target = targets.get(i).unwrap();
             let amount = amounts.get(i).unwrap();
+            check_access(&env, &target)?;
             let fee = calculate_fee(amount, fee_bps);
             let net_amount = amount - fee;
 
@@ -299,6 +337,65 @@ impl OnboardingBridge {
             .update_current_contract_wasm(new_wasm_hash.clone());
         env.events().publish(("Upgraded",), (admin, new_wasm_hash));
         Ok(())
+    }
+
+    // --- Blocklist / Allowlist ---
+
+    pub fn add_to_blocklist(env: Env, address: Address) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        read_admin(&env).require_auth();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Blocked(address), &true);
+        Ok(())
+    }
+
+    pub fn remove_from_blocklist(env: Env, address: Address) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        read_admin(&env).require_auth();
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Blocked(address));
+        Ok(())
+    }
+
+    pub fn add_to_allowlist(env: Env, address: Address) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        read_admin(&env).require_auth();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Allowlisted(address), &true);
+        Ok(())
+    }
+
+    pub fn remove_from_allowlist(env: Env, address: Address) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        read_admin(&env).require_auth();
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Allowlisted(address));
+        Ok(())
+    }
+
+    pub fn set_allowlist_mode(env: Env, enabled: bool) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        read_admin(&env).require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowlistMode, &enabled);
+        Ok(())
+    }
+
+    pub fn query_is_blocked(env: Env, address: Address) -> bool {
+        is_blocked(&env, &address)
+    }
+
+    pub fn query_is_allowlisted(env: Env, address: Address) -> bool {
+        is_allowlisted(&env, &address)
+    }
+
+    pub fn query_allowlist_mode(env: Env) -> bool {
+        allowlist_mode(&env)
     }
 }
 

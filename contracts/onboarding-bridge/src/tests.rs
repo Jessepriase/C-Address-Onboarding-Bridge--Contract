@@ -1255,3 +1255,56 @@ fn test_multiple_assets_independent_fee_caps() {
     assert_eq!(cap1, 100u32);
     assert_eq!(cap2, 300u32);
 }
+
+/********** Integration Tests **********/
+
+#[test]
+fn test_batch_with_daily_limits() {
+    let env = Env::default();
+    let (bridge, user, token_id, _admin) = setup_bridge(&env);
+    
+    bridge.set_source_daily_limit(&user, &token_id, &500i128).unwrap();
+    
+    let t1 = Address::generate(&env);
+    let t2 = Address::generate(&env);
+    let t3 = Address::generate(&env);
+    
+    let targets = Vec::from_array(&env, [t1.clone(), t2.clone(), t3.clone()]);
+    let amounts = Vec::from_array(&env, [200i128, 200i128, 200i128]);
+    
+    bridge.batch_fund_c_address(&user, &targets, &amounts, &token_id);
+    
+    assert_eq!(check_balance(&env, &token_id, &t1), 200i128);
+    assert_eq!(check_balance(&env, &token_id, &t2), 200i128);
+    assert_eq!(check_balance(&env, &token_id, &t3), 200i128);
+    assert_eq!(check_balance(&env, &token_id, &user), 400i128);
+}
+
+#[test]
+fn test_batch_refund_with_asset_fee_cap() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+    
+    bridge.initialize(&admin, &fee_collector, &500u32);
+    bridge.add_asset(&token_id);
+    bridge.set_asset_fee_cap(&token_id, &100u32).unwrap();
+    
+    mint_tokens(&env, &token_id, &user, 1000i128);
+    
+    let t1 = Address::generate(&env);
+    let t2 = Address::generate(&env);
+    
+    bridge.add_to_blocklist(&t2);
+    
+    let targets = Vec::from_array(&env, [t1.clone(), t2.clone()]);
+    let amounts = Vec::from_array(&env, [500i128, 500i128]);
+    
+    bridge.batch_fund_c_address(&user, &targets, &amounts, &token_id);
+    
+    let expected_net_t1 = 500i128 - (500i128 * 100 / 10000);
+    assert_eq!(check_balance(&env, &token_id, &t1), expected_net_t1);
+    assert_eq!(check_balance(&env, &token_id, &t2), 0i128);
+}

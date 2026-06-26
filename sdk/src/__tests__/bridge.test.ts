@@ -287,4 +287,33 @@ describe('OnboardingBridgeSDK', () => {
       expect(result).toBe(false);
     });
   });
+
+  describe('getAllBalances', () => {
+    it('returns a record of asset → balance strings', async () => {
+      const mockMap = new Map([[MOCK_ASSET, BigInt(1000)]]);
+      (scValToNative as jest.Mock).mockReturnValue(mockMap);
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: {} }],
+      });
+
+      const result = await sdk.getAllBalances([MOCK_ASSET]);
+
+      expect(result).toEqual({ [MOCK_ASSET]: '1000' });
+      expect(mockProvider.simulateTransaction).toHaveBeenCalled();
+    });
+
+    it('returns empty object when no results', async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({});
+
+      const result = await sdk.getAllBalances([MOCK_ASSET]);
+
+      expect(result).toEqual({});
+    });
+
+    it('throws when simulation returns an error', async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({ error: 'contract error' });
+
+      await expect(sdk.getAllBalances([MOCK_ASSET])).rejects.toThrow('Failed to get all balances');
+    });
+  });
 });

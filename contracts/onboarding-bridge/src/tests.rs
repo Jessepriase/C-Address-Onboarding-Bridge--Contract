@@ -919,6 +919,39 @@ fn test_batch_fund_rejects_non_whitelisted_asset() {
     );
 }
 
+/********** query_all_balances Tests **********/
+
+#[test]
+fn test_query_all_balances_returns_contract_balances() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+    bridge.initialize(&admin, &fee_collector, &0u32);
+
+    // Mint directly to the bridge contract
+    mint_tokens(&env, &token_id, &bridge_id, 750i128);
+
+    let assets = Vec::from_array(&env, [token_id.clone()]);
+    let balances = bridge.query_all_balances(&assets);
+
+    assert_eq!(balances.get(token_id).unwrap(), 750i128);
+}
+
+#[test]
+fn test_query_all_balances_empty_input() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    bridge.initialize(&admin, &fee_collector, &0u32);
+
+    let assets: Vec<Address> = Vec::new(&env);
+    let balances = bridge.query_all_balances(&assets);
+    assert_eq!(balances.len(), 0);
+}
+
 /********** Minimal Test Token **********/
 
 #[contracttype]

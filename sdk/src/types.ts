@@ -43,6 +43,15 @@ export interface UpgradeOptions {
   newWasmHash: string;
 }
 
+export interface ReclaimTokensOptions {
+  /** Asset contract address */
+  asset: string;
+  /** Amount to reclaim */
+  amount: string;
+  /** Destination address to receive the reclaimed tokens */
+  to: string;
+}
+
 export interface OffRampConfig {
   /** Your Moonpay API key */
   moonpayApiKey?: string;

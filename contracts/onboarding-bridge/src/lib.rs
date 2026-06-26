@@ -487,6 +487,17 @@ impl OnboardingBridge {
         token_client.balance(&c_address)
     }
 
+    pub fn query_all_balances(env: Env, assets: Vec<Address>) -> Map<Address, i128> {
+        let contract = env.current_contract_address();
+        let mut result: Map<Address, i128> = Map::new(&env);
+        for i in 0..assets.len() {
+            let asset = assets.get(i).unwrap();
+            let balance = token::Client::new(&env, &asset).balance(&contract);
+            result.set(asset, balance);
+        }
+        result
+    }
+
     pub fn query_fee_balance(env: Env, asset: Address) -> Result<i128, BridgeError> {
         check_initialized(&env)?;
         let token_client = token::Client::new(&env, &asset);

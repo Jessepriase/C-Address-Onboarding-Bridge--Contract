@@ -4,6 +4,7 @@ import {
   BatchFundCOptions,
   WithdrawFeesOptions,
   UpgradeOptions,
+  ReclaimTokensOptions,
   TransactionResult,
 } from './types';
 import {
@@ -297,6 +298,31 @@ export class OnboardingBridgeSDK {
 
     const scVal = (result as any).results?.[0]?.retval;
     return scVal ? scValToNative(scVal).toString() : '0';
+  }
+
+  /**
+   * Get all token balances held by the contract for the given assets.
+   * Returns a map of asset address → balance string.
+   */
+  async getAllBalances(assets: string[]): Promise<Record<string, string>> {
+    const result = await this.provider
+      .simulateTransaction(
+        this.buildSimulationTx('query_all_balances', [assets]),
+      );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to get all balances: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    if (!scVal) return {};
+
+    const native = scValToNative(scVal) as Map<string, bigint>;
+    const out: Record<string, string> = {};
+    native.forEach((value, key) => {
+      out[key] = value.toString();
+    });
+    return out;
   }
 
   /**

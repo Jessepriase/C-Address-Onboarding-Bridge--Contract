@@ -1,8 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env, Map,
-    Vec,
+    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Map, Symbol,
+    Val, Vec,
 };
 
 #[contracterror]
@@ -22,15 +22,7 @@ pub enum BridgeError {
 
     DuplicateNonce = 12,
     TransactionExpired = 13,
-    ReplayedNonce = 14,
-    NotRelayer = 15,
-    BelowThreshold = 16,
-    ThresholdExceedsRelayers = 17,
-    InvalidReleaseTime = 18,
-    TimelockNotFound = 19,
-    TimelockNotMatured = 20,
-    Unauthorized = 21,
-    BatchTooLarge = 22,
+    LoyaltyTokenNotSet = 14,
 }
 
 #[contracttype]
@@ -50,13 +42,7 @@ pub enum DataKey {
     SourceDailyLimit(Address, Address),
     AssetFeeCap(Address),
     Nonce(Address),
-    RelayerCount,
-    Relayer(BytesN<32>),
-    RelayerThreshold,
-    CrossChainNonce(BytesN<32>),
-    DailyUsage(Address, Address, u64),
-    TimelockId,
-    Timelock(u64),
+    ReferralRate,
 }
 
 const MAX_FEE_BPS: u32 = 1_000;
@@ -312,6 +298,19 @@ fn consume_nonce(env: &Env, caller: &Address, nonce: Option<u64>) -> Result<(), 
     Ok(())
 }
 
+// --- Referral rate helpers ---
+
+fn save_referral_rate(env: &Env, bps: u32) {
+    env.storage().instance().set(&DataKey::ReferralRate, &bps);
+}
+
+fn read_referral_rate(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::ReferralRate)
+        .unwrap_or(0)
+}
+
 // --- Cross-chain relayer registry ---
 
 fn relayer_count(env: &Env) -> u32 {
@@ -432,6 +431,89 @@ fn get_effective_fee_bps(env: &Env, asset: &Address, global_fee_bps: u32) -> u32
     global_fee_bps.min(cap)
 }
 
+// --- Fee tier helpers ---
+
+fn save_fee_tiers(env: &Env, tiers: &Vec<FeeTier>) {
+    env.storage().instance().set(&DataKey::FeeTiers, tiers);
+}
+
+fn read_fee_tiers(env: &Env) -> Option<Vec<FeeTier>> {
+    env.storage().instance().get(&DataKey::FeeTiers)
+}
+
+fn read_source_bridged_volume(env: &Env, source: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::SourceBridgedVolume(source.clone()))
+        .unwrap_or(0)
+}
+
+fn increment_source_bridged_volume(env: &Env, source: &Address, amount: i128) {
+    let current = read_source_bridged_volume(env, source);
+    env.storage()
+        .persistent()
+        .set(&DataKey::SourceBridgedVolume(source.clone()), &(current + amount));
+}
+
+fn get_tiered_fee_bps(env: &Env, source: &Address, fallback_bps: u32) -> u32 {
+    if let Some(tiers) = read_fee_tiers(env) {
+        let volume = read_source_bridged_volume(env, source);
+        for i in 0..tiers.len() {
+            let tier = tiers.get(i).unwrap();
+            if volume >= tier.min_volume && volume <= tier.max_volume {
+                return tier.fee_bps;
+            }
+        }
+    }
+    fallback_bps
+}
+
+fn find_current_tier(env: &Env, source: &Address) -> Option<FeeTier> {
+    if let Some(tiers) = read_fee_tiers(env) {
+        let volume = read_source_bridged_volume(env, source);
+        for i in 0..tiers.len() {
+            let tier = tiers.get(i).unwrap();
+            if volume >= tier.min_volume && volume <= tier.max_volume {
+                return Some(tier);
+            }
+        }
+    }
+    None
+}
+
+// --- Loyalty token helpers ---
+
+fn save_loyalty_token(env: &Env, token: &Address) {
+    env.storage().instance().set(&DataKey::LoyaltyToken, token);
+}
+
+fn read_loyalty_token(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKey::LoyaltyToken)
+}
+
+fn save_loyalty_amount_per_fund(env: &Env, amount: &i128) {
+    env.storage()
+        .instance()
+        .set(&DataKey::LoyaltyAmountPerFund, amount);
+}
+
+fn read_loyalty_amount_per_fund(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::LoyaltyAmountPerFund)
+        .unwrap_or(0)
+}
+
+fn mint_loyalty_tokens(env: &Env, recipient: &Address) {
+    if let Some(loyalty_token) = read_loyalty_token(env) {
+        let amount = read_loyalty_amount_per_fund(env);
+        if amount > 0 {
+            let token_client = token::Client::new(env, &loyalty_token);
+            token_client.transfer(&env.current_contract_address(), recipient, &amount);
+        }
+    }
+}
+
 #[contract]
 pub struct OnboardingBridge;
 
@@ -490,7 +572,8 @@ impl OnboardingBridge {
         token_client.transfer(&source, &env.current_contract_address(), &amount);
 
         let global_fee_bps = read_fee_bps(&env);
-        let effective_fee_bps = get_effective_fee_bps(&env, &asset, global_fee_bps);
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, global_fee_bps);
+        let effective_fee_bps = get_effective_fee_bps(&env, &asset, tiered_fee_bps);
         let fee = calculate_fee(amount, effective_fee_bps);
         let net_amount = amount - fee;
 
@@ -501,6 +584,10 @@ impl OnboardingBridge {
         increment_accrued_fees(&env, &asset, fee);
         increment_total_bridged(&env, &asset, net_amount);
         increment_total_fees_collected(&env, &asset, fee);
+        increment_source_bridged_volume(&env, &source, amount);
+
+        mint_loyalty_tokens(&env, &source);
+
         env.events()
             .publish(("CAddressFunded", source, target), (amount, fee, asset));
         Ok(())
@@ -721,6 +808,82 @@ impl OnboardingBridge {
     pub fn query_fee_bps(env: Env) -> Result<u32, BridgeError> {
         check_initialized(&env)?;
         Ok(read_fee_bps(&env))
+    }
+
+    pub fn set_referral_rate(env: Env, bps: u32, nonce: Option<u64>) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        if bps > MAX_FEE_BPS {
+            return Err(BridgeError::FeeTooHigh);
+        }
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        save_referral_rate(&env, bps);
+        env.events().publish(("ReferralRateChanged", bps), ());
+        Ok(())
+    }
+
+    pub fn query_referral_rate(env: Env) -> Result<u32, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_referral_rate(&env))
+    }
+
+    pub fn fund_c_address_with_referral(
+        env: Env,
+        source: Address,
+        target: Address,
+        asset: Address,
+        amount: i128,
+        referrer: Option<Address>,
+    ) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        if amount <= 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        check_access(&env, &target)?;
+        check_asset_whitelisted(&env, &asset)?;
+        check_daily_limit(&env, &source, &asset, amount)?;
+        source.require_auth();
+
+        let token_client = token::Client::new(&env, &asset);
+        token_client.transfer(&source, &env.current_contract_address(), &amount);
+
+        let global_fee_bps = read_fee_bps(&env);
+        let effective_fee_bps = get_effective_fee_bps(&env, &asset, global_fee_bps);
+        let fee = calculate_fee(amount, effective_fee_bps);
+        let net_amount = amount - fee;
+
+        if net_amount > 0 {
+            token_client.transfer(&env.current_contract_address(), &target, &net_amount);
+        }
+
+        // Split fee: referral portion goes directly to referrer
+        let referral_fee = if let Some(ref referrer_addr) = referrer {
+            let referral_rate = read_referral_rate(&env);
+            let rf = (fee * referral_rate as i128) / FEE_DENOMINATOR;
+            if rf > 0 {
+                token_client.transfer(&env.current_contract_address(), referrer_addr, &rf);
+                env.events().publish(
+                    ("ReferralPaid", source.clone(), referrer_addr.clone()),
+                    (rf, asset.clone()),
+                );
+            }
+            rf
+        } else {
+            0
+        };
+
+        let protocol_fee = fee - referral_fee;
+        increment_accrued_fees(&env, &asset, protocol_fee);
+        increment_total_bridged(&env, &asset, net_amount);
+        increment_total_fees_collected(&env, &asset, fee);
+
+        env.events().publish(
+            ("CAddressFunded", source, target),
+            (amount, fee, asset),
+        );
+        Ok(())
     }
 
     pub fn query_fee_collector(env: Env) -> Result<Address, BridgeError> {
@@ -946,6 +1109,77 @@ impl OnboardingBridge {
     pub fn query_whitelisted_assets(env: Env) -> Result<Vec<Address>, BridgeError> {
         check_initialized(&env)?;
         Ok(read_whitelist(&env).keys())
+    }
+
+    // --- Loyalty Token ---
+
+    pub fn set_loyalty_token(
+        env: Env,
+        token: Address,
+        amount_per_fund: i128,
+    ) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        if amount_per_fund < 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        save_loyalty_token(&env, &token);
+        save_loyalty_amount_per_fund(&env, &amount_per_fund);
+        env.events()
+            .publish(("LoyaltyTokenSet", admin), (token, amount_per_fund));
+        Ok(())
+    }
+
+    pub fn query_loyalty_token(env: Env) -> Result<(Address, i128), BridgeError> {
+        check_initialized(&env)?;
+        let token = read_loyalty_token(&env).ok_or(BridgeError::LoyaltyTokenNotSet)?;
+        let amount = read_loyalty_amount_per_fund(&env);
+        Ok((token, amount))
+    }
+
+    // --- Tiered Fees ---
+
+    pub fn set_fee_tiers(env: Env, tiers: Vec<FeeTier>) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        for i in 0..tiers.len() {
+            let tier = tiers.get(i).unwrap();
+            if tier.fee_bps > MAX_FEE_BPS {
+                return Err(BridgeError::FeeTooHigh);
+            }
+        }
+        save_fee_tiers(&env, &tiers);
+        env.events()
+            .publish(("FeeTiersSet", admin), (tiers.len(),));
+        Ok(())
+    }
+
+    pub fn query_fee_tiers(env: Env) -> Result<Vec<FeeTier>, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_fee_tiers(&env).unwrap_or_else(|| {
+            let mut tiers = Vec::new(&env);
+            let fee_bps = read_fee_bps(&env);
+            tiers.push_back(FeeTier {
+                min_volume: 0,
+                max_volume: i128::MAX,
+                fee_bps,
+            });
+            tiers
+        }))
+    }
+
+    pub fn query_current_tier(env: Env, source: Address) -> Result<FeeTier, BridgeError> {
+        check_initialized(&env)?;
+        Ok(find_current_tier(&env, &source).unwrap_or_else(|| {
+            let fee_bps = read_fee_bps(&env);
+            FeeTier {
+                min_volume: 0,
+                max_volume: i128::MAX,
+                fee_bps,
+            }
+        }))
     }
 
     // --- Cross-chain Onboarding ---
@@ -1183,3 +1417,9 @@ impl OnboardingBridge {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod benchmarks;
+
+#[cfg(test)]
+mod integration_tests;

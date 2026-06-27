@@ -69,3 +69,35 @@ export interface TransactionResult {
   /** Error message if failed */
   error?: string;
 }
+
+// --- Cross-chain types ---
+
+/** A single relayer attestation: ed25519 pubkey (hex) + signature (hex) over the payload hash */
+export interface RelayerSig {
+  /** 32-byte Ed25519 public key as hex string */
+  pubkey: string;
+  /** 64-byte Ed25519 signature as hex string */
+  signature: string;
+}
+
+/** Options for funding a C-address from a cross-chain event */
+export interface CrossChainFundOptions {
+  /** Numeric source chain id (1 = Ethereum, 101 = Solana, etc.) */
+  chainId: number;
+  /** 32-byte source-chain transaction hash as hex string */
+  txHash: string;
+  /** Destination Soroban C-address */
+  target: string;
+  /** Whitelisted token contract address on Stellar */
+  asset: string;
+  /** Gross amount (fee deducted before crediting target) */
+  amount: string;
+  /** At least `threshold` relayer signatures over the canonical payload hash */
+  sigs: RelayerSig[];
+}
+
+/** Options for adding/removing a relayer */
+export interface RelayerManagementOptions {
+  /** 32-byte Ed25519 public key as hex string */
+  pubkey: string;
+}

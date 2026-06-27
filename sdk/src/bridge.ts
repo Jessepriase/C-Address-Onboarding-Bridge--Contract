@@ -6,6 +6,8 @@ import {
   UpgradeOptions,
   ReclaimTokensOptions,
   TransactionResult,
+  CrossChainFundOptions,
+  RelayerManagementOptions,
 } from './types';
 import { assertAccountAddress, assertContractAddress } from './validate';
 import {
@@ -531,6 +533,135 @@ export class OnboardingBridgeSDK {
         error: error.message || 'Unknown error',
       };
     }
+  }
+
+  // --- Cross-chain methods ---
+
+  /**
+   * Fund a C-address from a cross-chain event (called by the relayer service).
+   * Requires at least `threshold` valid relayer signatures over the canonical payload hash.
+   */
+  async fundCrosschain(
+    options: CrossChainFundOptions,
+    relayerKeypair: any,
+  ): Promise<TransactionResult> {
+    try {
+      const relayerAccount = await this.provider.getAccount(relayerKeypair.publicKey());
+
+      const sigsScVal = xdr.ScVal.scvVec(
+        options.sigs.map((s) => {
+          const pubkeyBytes = Buffer.from(s.pubkey, 'hex');
+          const sigBytes = Buffer.from(s.signature, 'hex');
+          return xdr.ScVal.scvMap([
+            new xdr.ScMapEntry({ key: xdr.ScVal.scvSymbol('pubkey'), val: xdr.ScVal.scvBytes(pubkeyBytes) }),
+            new xdr.ScMapEntry({ key: xdr.ScVal.scvSymbol('signature'), val: xdr.ScVal.scvBytes(sigBytes) }),
+          ]);
+        }),
+      );
+
+      const txHashBytes = Buffer.from(options.txHash.replace('0x', ''), 'hex');
+
+      const tx = new TransactionBuilder(relayerAccount, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(
+          this.contract.call(
+            'fund_c_address_crosschain',
+            nativeToScVal(options.chainId, { type: 'u32' }),
+            xdr.ScVal.scvBytes(txHashBytes),
+            new Address(options.target).toScVal(),
+            new Address(options.asset).toScVal(),
+            nativeToScVal(BigInt(options.amount), { type: 'i128' }),
+            sigsScVal,
+          ),
+        )
+        .setTimeout(30)
+        .build();
+
+      const preparedTx = await this.provider.prepareTransaction(tx);
+      preparedTx.sign(relayerKeypair);
+      const response = await this.provider.sendTransaction(preparedTx);
+
+      return { hash: response.hash, status: response.status === 'ERROR' ? 'failed' : 'pending' };
+    } catch (error: any) {
+      return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
+    }
+  }
+
+  /** Register an Ed25519 relayer pubkey (admin only). */
+  async addRelayer(options: RelayerManagementOptions, adminKeypair: any): Promise<TransactionResult> {
+    try {
+      const adminAccount = await this.provider.getAccount(adminKeypair.publicKey());
+      const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
+        .addOperation(this.contract.call('add_relayer', xdr.ScVal.scvBytes(Buffer.from(options.pubkey, 'hex'))))
+        .setTimeout(30)
+        .build();
+      const preparedTx = await this.provider.prepareTransaction(tx);
+      preparedTx.sign(adminKeypair);
+      const response = await this.provider.sendTransaction(preparedTx);
+      return { hash: response.hash, status: response.status === 'ERROR' ? 'failed' : 'pending' };
+    } catch (error: any) {
+      return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
+    }
+  }
+
+  /** Remove an Ed25519 relayer pubkey (admin only). */
+  async removeRelayer(options: RelayerManagementOptions, adminKeypair: any): Promise<TransactionResult> {
+    try {
+      const adminAccount = await this.provider.getAccount(adminKeypair.publicKey());
+      const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
+        .addOperation(this.contract.call('remove_relayer', xdr.ScVal.scvBytes(Buffer.from(options.pubkey, 'hex'))))
+        .setTimeout(30)
+        .build();
+      const preparedTx = await this.provider.prepareTransaction(tx);
+      preparedTx.sign(adminKeypair);
+      const response = await this.provider.sendTransaction(preparedTx);
+      return { hash: response.hash, status: response.status === 'ERROR' ? 'failed' : 'pending' };
+    } catch (error: any) {
+      return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
+    }
+  }
+
+  /** Set the M-of-N relayer threshold (admin only). Must not exceed total relayer count. */
+  async setRelayerThreshold(threshold: number, adminKeypair: any): Promise<TransactionResult> {
+    try {
+      const adminAccount = await this.provider.getAccount(adminKeypair.publicKey());
+      const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
+        .addOperation(this.contract.call('set_relayer_threshold', nativeToScVal(threshold, { type: 'u32' })))
+        .setTimeout(30)
+        .build();
+      const preparedTx = await this.provider.prepareTransaction(tx);
+      preparedTx.sign(adminKeypair);
+      const response = await this.provider.sendTransaction(preparedTx);
+      return { hash: response.hash, status: response.status === 'ERROR' ? 'failed' : 'pending' };
+    } catch (error: any) {
+      return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
+    }
+  }
+
+  /** Query the current relayer threshold (M in M-of-N). */
+  async queryRelayerThreshold(): Promise<number> {
+    const result = await this.provider.simulateTransaction(
+      this.buildSimulationTx('query_relayer_threshold', []),
+    );
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to query relayer threshold: ${result.error}`);
+    }
+    const scVal = (result as any).results?.[0]?.retval;
+    return scVal ? Number(scValToNative(scVal)) : 0;
+  }
+
+  /** Query whether a given Ed25519 pubkey (hex) is a registered relayer. */
+  async queryIsRelayer(pubkeyHex: string): Promise<boolean> {
+    const result = await this.provider.simulateTransaction(
+      this.buildSimulationTx('query_is_relayer', [Buffer.from(pubkeyHex, 'hex')]),
+    );
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to query relayer: ${result.error}`);
+    }
+    const scVal = (result as any).results?.[0]?.retval;
+    return scVal ? Boolean(scValToNative(scVal)) : false;
   }
 
   /**

@@ -18,7 +18,11 @@ jest.mock('@stellar/stellar-sdk', () => ({
     ScVal: {
       scvVoid: jest.fn().mockReturnValue({}),
       scvVec: jest.fn().mockReturnValue({}),
+      scvBytes: jest.fn().mockReturnValue({}),
+      scvMap: jest.fn().mockReturnValue({}),
+      scvSymbol: jest.fn().mockReturnValue({}),
     },
+    ScMapEntry: jest.fn().mockImplementation(() => ({})),
   },
   Address: jest.fn().mockImplementation(() => ({
     toScVal: jest.fn().mockReturnValue({}),
@@ -318,6 +322,153 @@ describe('OnboardingBridgeSDK', () => {
       mockProvider.simulateTransaction.mockResolvedValue({ error: 'contract error' });
 
       await expect(sdk.getAllBalances([MOCK_ASSET])).rejects.toThrow('Failed to get all balances');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Cross-chain tests
+  // ---------------------------------------------------------------------------
+
+  describe('fundCrosschain', () => {
+    const MOCK_SIG = {
+      pubkey: 'a'.repeat(64), // 32-byte hex
+      signature: 'b'.repeat(128), // 64-byte hex
+    };
+
+    it('returns pending status on success', async () => {
+      const result = await sdk.fundCrosschain(
+        {
+          chainId: 1,
+          txHash: '0x' + 'ab'.repeat(32),
+          target: MOCK_ADDRESS,
+          asset: MOCK_ASSET,
+          amount: '1000',
+          sigs: [MOCK_SIG],
+        },
+        mockKeypair,
+      );
+
+      expect(result.status).toBe('pending');
+      expect(result.hash).toBe('mock_tx_hash');
+      expect(mockProvider.getAccount).toHaveBeenCalledWith(MOCK_ADDRESS);
+      expect(mockProvider.prepareTransaction).toHaveBeenCalled();
+      expect(mockProvider.sendTransaction).toHaveBeenCalled();
+    });
+
+    it('returns failed on ERROR response', async () => {
+      mockProvider.sendTransaction.mockResolvedValue({ hash: 'err', status: 'ERROR' });
+
+      const result = await sdk.fundCrosschain(
+        { chainId: 1, txHash: 'ab'.repeat(32), target: MOCK_ADDRESS, asset: MOCK_ASSET, amount: '1000', sigs: [MOCK_SIG] },
+        mockKeypair,
+      );
+
+      expect(result.status).toBe('failed');
+    });
+
+    it('returns failed on network error', async () => {
+      mockProvider.getAccount.mockRejectedValue(new Error('RPC down'));
+
+      const result = await sdk.fundCrosschain(
+        { chainId: 1, txHash: 'ab'.repeat(32), target: MOCK_ADDRESS, asset: MOCK_ASSET, amount: '500', sigs: [MOCK_SIG] },
+        mockKeypair,
+      );
+
+      expect(result.status).toBe('failed');
+      expect(result.error).toBe('RPC down');
+    });
+  });
+
+  describe('addRelayer', () => {
+    it('returns pending status on success', async () => {
+      const result = await sdk.addRelayer({ pubkey: 'a'.repeat(64) }, mockKeypair);
+
+      expect(result.status).toBe('pending');
+      expect(mockProvider.getAccount).toHaveBeenCalledWith(MOCK_ADDRESS);
+    });
+
+    it('returns failed on error', async () => {
+      mockProvider.sendTransaction.mockResolvedValue({ hash: '', status: 'ERROR' });
+
+      const result = await sdk.addRelayer({ pubkey: 'a'.repeat(64) }, mockKeypair);
+
+      expect(result.status).toBe('failed');
+    });
+  });
+
+  describe('removeRelayer', () => {
+    it('returns pending status on success', async () => {
+      const result = await sdk.removeRelayer({ pubkey: 'a'.repeat(64) }, mockKeypair);
+
+      expect(result.status).toBe('pending');
+    });
+
+    it('returns failed on network error', async () => {
+      mockProvider.getAccount.mockRejectedValue(new Error('timeout'));
+
+      const result = await sdk.removeRelayer({ pubkey: 'a'.repeat(64) }, mockKeypair);
+
+      expect(result.status).toBe('failed');
+      expect(result.error).toBe('timeout');
+    });
+  });
+
+  describe('setRelayerThreshold', () => {
+    it('returns pending status on success', async () => {
+      const result = await sdk.setRelayerThreshold(2, mockKeypair);
+
+      expect(result.status).toBe('pending');
+      expect(mockProvider.sendTransaction).toHaveBeenCalled();
+    });
+  });
+
+  describe('queryRelayerThreshold', () => {
+    it('returns threshold as a number', async () => {
+      (scValToNative as jest.Mock).mockReturnValue(2);
+      mockProvider.simulateTransaction.mockResolvedValue({ results: [{ retval: {} }] });
+
+      const threshold = await sdk.queryRelayerThreshold();
+
+      expect(threshold).toBe(2);
+    });
+
+    it('returns 0 when no results', async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({});
+
+      const threshold = await sdk.queryRelayerThreshold();
+
+      expect(threshold).toBe(0);
+    });
+
+    it('throws on simulation error', async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({ error: 'fail' });
+
+      await expect(sdk.queryRelayerThreshold()).rejects.toThrow('Failed to query relayer threshold');
+    });
+  });
+
+  describe('queryIsRelayer', () => {
+    it('returns true when pubkey is a registered relayer', async () => {
+      (scValToNative as jest.Mock).mockReturnValue(true);
+      mockProvider.simulateTransaction.mockResolvedValue({ results: [{ retval: {} }] });
+
+      const result = await sdk.queryIsRelayer('a'.repeat(64));
+
+      expect(result).toBe(true);
+    });
+
+    it('returns false when no results', async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({});
+
+      const result = await sdk.queryIsRelayer('a'.repeat(64));
+
+      expect(result).toBe(false);
+    });
+
+    it('throws on simulation error', async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({ error: 'fail' });
+
+      await expect(sdk.queryIsRelayer('a'.repeat(64))).rejects.toThrow('Failed to query relayer');
     });
   });
 });

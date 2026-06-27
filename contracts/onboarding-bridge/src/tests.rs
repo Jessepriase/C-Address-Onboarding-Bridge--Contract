@@ -1693,3 +1693,243 @@ fn test_batch_fund_deadline_in_future_passes() {
     bridge.batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &Some(9999u64));
     assert_eq!(check_balance(&env, &token_id, &t1), 990i128); // 1% fee
 }
+
+/********** Cross-chain Onboarding Tests **********/
+
+#[cfg(test)]
+mod crosschain_tests {
+    use super::*;
+    use crate::{BridgeError, OnboardingBridge, RelayerSig};
+    use ed25519_dalek::{Signer, SigningKey};
+    use soroban_sdk::{Bytes, BytesN, Env, Vec};
+
+    fn make_signing_key(seed: [u8; 32]) -> SigningKey {
+        SigningKey::from_bytes(&seed)
+    }
+
+    /// Replicates the contract's payload hash for a given set of call arguments.
+    fn build_payload_hash(
+        env: &Env,
+        chain_id: u32,
+        tx_hash: &BytesN<32>,
+        target: &soroban_sdk::Address,
+        asset: &soroban_sdk::Address,
+        amount: i128,
+    ) -> BytesN<32> {
+        let tx_hash_bytes: Bytes = tx_hash.clone().into();
+
+        // nonce = sha256(chain_id_be4 || tx_hash)
+        let mut nonce_pre = Bytes::new(env);
+        nonce_pre.extend_from_array(&chain_id.to_be_bytes());
+        nonce_pre.append(&tx_hash_bytes);
+        let nonce: BytesN<32> = env.crypto().sha256(&nonce_pre).into();
+
+        let target_bytes = target.clone().to_xdr(env);
+        let asset_bytes = asset.clone().to_xdr(env);
+        let nonce_bytes: Bytes = nonce.into();
+
+        let mut payload = Bytes::new(env);
+        payload.extend_from_array(&chain_id.to_be_bytes());
+        payload.append(&tx_hash_bytes);
+        payload.append(&target_bytes);
+        payload.append(&asset_bytes);
+        payload.extend_from_array(&amount.to_be_bytes());
+        payload.append(&nonce_bytes);
+
+        env.crypto().sha256(&payload).into()
+    }
+
+    fn make_relayer_sig(
+        env: &Env,
+        signing_key: &SigningKey,
+        payload_hash: &BytesN<32>,
+    ) -> RelayerSig {
+        let hash_bytes: Bytes = payload_hash.clone().into();
+        let mut hash_arr = [0u8; 32];
+        for i in 0..32 {
+            hash_arr[i] = hash_bytes.get(i as u32).unwrap();
+        }
+        let sig = signing_key.sign(&hash_arr);
+        RelayerSig {
+            pubkey: BytesN::from_array(env, signing_key.verifying_key().as_bytes()),
+            signature: BytesN::from_array(env, &sig.to_bytes()),
+        }
+    }
+
+    fn setup(env: &Env) -> (
+        soroban_sdk::Address,
+        soroban_sdk::Address,
+        soroban_sdk::Address,
+        crate::OnboardingBridgeClient,
+    ) {
+        let bridge_id = env.register(OnboardingBridge, ());
+        let token_id = env.register(TestToken, ());
+        env.mock_all_auths();
+
+        let admin = soroban_sdk::Address::generate(env);
+        let fee_collector = soroban_sdk::Address::generate(env);
+
+        let bridge = crate::OnboardingBridgeClient::new(env, &bridge_id);
+        TestTokenClient::new(env, &token_id).initialize(
+            &admin,
+            &7u32,
+            &"Test".into_val(env),
+            &"TST".into_val(env),
+        );
+        bridge.initialize(&admin, &fee_collector, &100u32); // 1% fee
+        bridge.add_asset(&token_id);
+
+        // Fund the bridge contract so it can pay out cross-chain claims
+        TestTokenClient::new(env, &token_id).mint(&bridge_id, &10_000i128);
+
+        (bridge_id, token_id, admin, bridge)
+    }
+
+    #[test]
+    fn test_crosschain_happy_path_single_relayer() {
+        let env = Env::default();
+        let (bridge_id, token_id, _admin, bridge) = setup(&env);
+
+        let sk = make_signing_key([1u8; 32]);
+        let pubkey = BytesN::from_array(&env, sk.verifying_key().as_bytes());
+
+        bridge.add_relayer(&pubkey);
+        bridge.set_relayer_threshold(&1u32);
+
+        let target = soroban_sdk::Address::generate(&env);
+        let tx_hash = BytesN::from_array(&env, &[0xab; 32]);
+        let chain_id: u32 = 1;
+        let amount: i128 = 1000;
+
+        let payload_hash = build_payload_hash(&env, chain_id, &tx_hash, &target, &token_id, amount);
+        let sig = make_relayer_sig(&env, &sk, &payload_hash);
+        let sigs = Vec::from_array(&env, [sig]);
+
+        bridge.fund_c_address_crosschain(&chain_id, &tx_hash, &target, &token_id, &amount, &sigs);
+
+        // 1% fee on 1000 = 10; net = 990
+        assert_eq!(TestTokenClient::new(&env, &token_id).balance(&target), 990i128);
+        assert_eq!(TestTokenClient::new(&env, &token_id).balance(&bridge_id), 10_000 - 990);
+    }
+
+    #[test]
+    fn test_crosschain_happy_path_2_of_3() {
+        let env = Env::default();
+        let (_bridge_id, token_id, _admin, bridge) = setup(&env);
+
+        let sk1 = make_signing_key([1u8; 32]);
+        let sk2 = make_signing_key([2u8; 32]);
+        let sk3 = make_signing_key([3u8; 32]);
+
+        bridge.add_relayer(&BytesN::from_array(&env, sk1.verifying_key().as_bytes()));
+        bridge.add_relayer(&BytesN::from_array(&env, sk2.verifying_key().as_bytes()));
+        bridge.add_relayer(&BytesN::from_array(&env, sk3.verifying_key().as_bytes()));
+        bridge.set_relayer_threshold(&2u32);
+
+        let target = soroban_sdk::Address::generate(&env);
+        let tx_hash = BytesN::from_array(&env, &[0xcd; 32]);
+        let chain_id: u32 = 101;
+        let amount: i128 = 500;
+
+        let payload_hash = build_payload_hash(&env, chain_id, &tx_hash, &target, &token_id, amount);
+        let sigs = Vec::from_array(&env, [
+            make_relayer_sig(&env, &sk1, &payload_hash),
+            make_relayer_sig(&env, &sk2, &payload_hash),
+        ]);
+
+        bridge.fund_c_address_crosschain(&chain_id, &tx_hash, &target, &token_id, &amount, &sigs);
+        assert_eq!(TestTokenClient::new(&env, &token_id).balance(&target), 495i128);
+    }
+
+    #[test]
+    fn test_crosschain_replay_rejected() {
+        let env = Env::default();
+        let (_bridge_id, token_id, _admin, bridge) = setup(&env);
+
+        let sk = make_signing_key([1u8; 32]);
+        bridge.add_relayer(&BytesN::from_array(&env, sk.verifying_key().as_bytes()));
+        bridge.set_relayer_threshold(&1u32);
+
+        let target = soroban_sdk::Address::generate(&env);
+        let tx_hash = BytesN::from_array(&env, &[0xef; 32]);
+
+        let payload_hash = build_payload_hash(&env, 1, &tx_hash, &target, &token_id, 100);
+        let sigs = Vec::from_array(&env, [make_relayer_sig(&env, &sk, &payload_hash)]);
+
+        bridge.fund_c_address_crosschain(&1u32, &tx_hash, &target, &token_id, &100i128, &sigs);
+
+        // Second call with same tx_hash must fail
+        assert_eq!(
+            bridge.try_fund_c_address_crosschain(&1u32, &tx_hash, &target, &token_id, &100i128, &sigs),
+            Err(Ok(BridgeError::ReplayedNonce))
+        );
+    }
+
+    #[test]
+    fn test_crosschain_below_threshold_rejected() {
+        let env = Env::default();
+        let (_bridge_id, token_id, _admin, bridge) = setup(&env);
+
+        let sk1 = make_signing_key([1u8; 32]);
+        let sk2 = make_signing_key([2u8; 32]);
+
+        bridge.add_relayer(&BytesN::from_array(&env, sk1.verifying_key().as_bytes()));
+        bridge.add_relayer(&BytesN::from_array(&env, sk2.verifying_key().as_bytes()));
+        bridge.set_relayer_threshold(&2u32);
+
+        let target = soroban_sdk::Address::generate(&env);
+        let tx_hash = BytesN::from_array(&env, &[0x11; 32]);
+
+        let payload_hash = build_payload_hash(&env, 1, &tx_hash, &target, &token_id, 100);
+        // Only 1 sig when threshold is 2
+        let sigs = Vec::from_array(&env, [make_relayer_sig(&env, &sk1, &payload_hash)]);
+
+        assert_eq!(
+            bridge.try_fund_c_address_crosschain(&1u32, &tx_hash, &target, &token_id, &100i128, &sigs),
+            Err(Ok(BridgeError::BelowThreshold))
+        );
+    }
+
+    #[test]
+    fn test_crosschain_non_relayer_rejected() {
+        let env = Env::default();
+        let (_bridge_id, token_id, _admin, bridge) = setup(&env);
+
+        let sk_registered = make_signing_key([1u8; 32]);
+        let sk_stranger = make_signing_key([9u8; 32]); // not registered
+
+        bridge.add_relayer(&BytesN::from_array(&env, sk_registered.verifying_key().as_bytes()));
+        bridge.set_relayer_threshold(&1u32);
+
+        let target = soroban_sdk::Address::generate(&env);
+        let tx_hash = BytesN::from_array(&env, &[0x22; 32]);
+
+        let payload_hash = build_payload_hash(&env, 1, &tx_hash, &target, &token_id, 100);
+        let sigs = Vec::from_array(&env, [make_relayer_sig(&env, &sk_stranger, &payload_hash)]);
+
+        assert_eq!(
+            bridge.try_fund_c_address_crosschain(&1u32, &tx_hash, &target, &token_id, &100i128, &sigs),
+            Err(Ok(BridgeError::NotRelayer))
+        );
+    }
+
+    #[test]
+    fn test_add_remove_relayer_and_threshold() {
+        let env = Env::default();
+        let (_bridge_id, _token_id, _admin, bridge) = setup(&env);
+
+        let pk = BytesN::from_array(&env, make_signing_key([5u8; 32]).verifying_key().as_bytes());
+
+        bridge.add_relayer(&pk);
+        assert!(bridge.query_is_relayer(&pk));
+
+        bridge.set_relayer_threshold(&1u32);
+        assert_eq!(bridge.query_relayer_threshold(), 1u32);
+
+        // Can't remove last relayer when it would drop below threshold
+        assert_eq!(
+            bridge.try_remove_relayer(&pk),
+            Err(Ok(BridgeError::BelowThreshold))
+        );
+    }
+}

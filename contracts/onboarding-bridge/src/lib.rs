@@ -275,6 +275,126 @@ fn consume_nonce(env: &Env, caller: &Address, nonce: Option<u64>) -> Result<(), 
     Ok(())
 }
 
+// --- Cross-chain relayer registry ---
+
+fn relayer_count(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::RelayerCount)
+        .unwrap_or(0u32)
+}
+
+fn is_relayer(env: &Env, pubkey: &BytesN<32>) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Relayer(pubkey.clone()))
+        .unwrap_or(false)
+}
+
+fn add_relayer(env: &Env, pubkey: &BytesN<32>) {
+    if !is_relayer(env, pubkey) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Relayer(pubkey.clone()), &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::RelayerCount, &(relayer_count(env) + 1));
+    }
+}
+
+fn remove_relayer(env: &Env, pubkey: &BytesN<32>) {
+    if is_relayer(env, pubkey) {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Relayer(pubkey.clone()));
+        let count = relayer_count(env);
+        env.storage()
+            .instance()
+            .set(&DataKey::RelayerCount, &(count.saturating_sub(1)));
+    }
+}
+
+fn relayer_threshold(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::RelayerThreshold)
+        .unwrap_or(1u32)
+}
+
+fn save_relayer_threshold(env: &Env, threshold: u32) {
+    env.storage()
+        .instance()
+        .set(&DataKey::RelayerThreshold, &threshold);
+}
+
+fn is_nonce_used(env: &Env, nonce: &BytesN<32>) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::CrossChainNonce(nonce.clone()))
+        .unwrap_or(false)
+}
+
+fn mark_nonce_used(env: &Env, nonce: &BytesN<32>) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::CrossChainNonce(nonce.clone()), &true);
+}
+
+// --- Daily limit helpers ---
+
+fn save_source_daily_limit(env: &Env, source: &Address, asset: &Address, limit: i128) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::SourceDailyLimit(source.clone(), asset.clone()), &limit);
+}
+
+fn read_source_daily_limit(env: &Env, source: &Address, asset: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::SourceDailyLimit(source.clone(), asset.clone()))
+        .unwrap_or(0)
+}
+
+fn current_day(env: &Env) -> u64 {
+    env.ledger().timestamp() / 86_400
+}
+
+fn check_daily_limit(env: &Env, source: &Address, asset: &Address, amount: i128) -> Result<(), BridgeError> {
+    let limit = read_source_daily_limit(env, source, asset);
+    if limit == 0 {
+        return Ok(()); // no limit set
+    }
+    let day = current_day(env);
+    let key = DataKey::DailyUsage(source.clone(), asset.clone(), day);
+    let used: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+    if used + amount > limit {
+        return Err(BridgeError::DailyLimitExceeded);
+    }
+    env.storage().persistent().set(&key, &(used + amount));
+    Ok(())
+}
+
+// --- Asset fee cap helpers ---
+
+fn save_asset_fee_cap(env: &Env, asset: &Address, max_fee_bps: u32) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::AssetFeeCap(asset.clone()), &max_fee_bps);
+}
+
+fn read_asset_fee_cap(env: &Env, asset: &Address) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::AssetFeeCap(asset.clone()))
+        .unwrap_or(MAX_FEE_BPS)
+}
+
+/// Returns the effective fee bps for an asset, capped by its per-asset fee cap.
+fn get_effective_fee_bps(env: &Env, asset: &Address, global_fee_bps: u32) -> u32 {
+    let cap = read_asset_fee_cap(env, asset);
+    global_fee_bps.min(cap)
+}
+
 #[contract]
 pub struct OnboardingBridge;
 
@@ -789,6 +909,143 @@ impl OnboardingBridge {
     pub fn query_whitelisted_assets(env: Env) -> Result<Vec<Address>, BridgeError> {
         check_initialized(&env)?;
         Ok(read_whitelist(&env).keys())
+    }
+
+    // --- Cross-chain Onboarding ---
+
+    /// Fund a C-address from a cross-chain event.
+    ///
+    /// Parameters:
+    /// - `chain_id`  : numeric id of the source chain (e.g. 1 = Ethereum, 101 = Solana)
+    /// - `tx_hash`   : 32-byte hash of the source-chain transaction
+    /// - `target`    : Soroban C-address to credit
+    /// - `asset`     : whitelisted token contract address
+    /// - `amount`    : gross amount (fee deducted before crediting target)
+    /// - `sigs`      : at least `threshold` distinct relayer Ed25519 signatures over
+    ///                 sha256(chain_id_be4 || tx_hash || target_bytes || asset_bytes ||
+    ///                        amount_be16 || nonce)
+    ///                 where nonce = sha256(chain_id_be4 || tx_hash)
+    pub fn fund_c_address_crosschain(
+        env: Env,
+        chain_id: u32,
+        tx_hash: BytesN<32>,
+        target: Address,
+        asset: Address,
+        amount: i128,
+        sigs: Vec<RelayerSig>,
+    ) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        if amount <= 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        check_access(&env, &target)?;
+        check_asset_whitelisted(&env, &asset)?;
+
+        // Derive nonce = sha256(chain_id_be4 || tx_hash)
+        let mut nonce_pre: soroban_sdk::Bytes = soroban_sdk::Bytes::new(&env);
+        nonce_pre.extend_from_array(&chain_id.to_be_bytes());
+        let tx_hash_bytes: soroban_sdk::Bytes = tx_hash.clone().into();
+        nonce_pre.append(&tx_hash_bytes);
+        let nonce: BytesN<32> = env.crypto().sha256(&nonce_pre).into();
+
+        if is_nonce_used(&env, &nonce) {
+            return Err(BridgeError::ReplayedNonce);
+        }
+
+        // Build payload hash = sha256(chain_id_be4 || tx_hash || target_bytes ||
+        //                              asset_bytes || amount_be16 || nonce)
+        let target_bytes = target.clone().to_xdr(&env);
+        let asset_bytes = asset.clone().to_xdr(&env);
+        let nonce_bytes: soroban_sdk::Bytes = nonce.clone().into();
+
+        let mut payload: soroban_sdk::Bytes = soroban_sdk::Bytes::new(&env);
+        payload.extend_from_array(&chain_id.to_be_bytes());
+        payload.append(&tx_hash_bytes);
+        payload.append(&target_bytes);
+        payload.append(&asset_bytes);
+        payload.extend_from_array(&amount.to_be_bytes());
+        payload.append(&nonce_bytes);
+
+        let payload_hash: BytesN<32> = env.crypto().sha256(&payload).into();
+
+        // Verify M-of-N relayer signatures
+        let threshold = relayer_threshold(&env);
+        let mut valid: u32 = 0;
+        for i in 0..sigs.len() {
+            let sig = sigs.get(i).unwrap();
+            if !is_relayer(&env, &sig.pubkey) {
+                return Err(BridgeError::NotRelayer);
+            }
+            // Panics (traps) on invalid sig — convert to error via try pattern
+            env.crypto()
+                .ed25519_verify(&sig.pubkey, &payload_hash.clone().into(), &sig.signature);
+            valid += 1;
+        }
+        if valid < threshold {
+            return Err(BridgeError::BelowThreshold);
+        }
+
+        // Consume nonce, apply fee, credit target
+        mark_nonce_used(&env, &nonce);
+
+        let fee_bps = read_fee_bps(&env);
+        let effective_fee_bps = get_effective_fee_bps(&env, &asset, fee_bps);
+        let fee = calculate_fee(amount, effective_fee_bps);
+        let net_amount = amount - fee;
+
+        let token_client = token::Client::new(&env, &asset);
+        if net_amount > 0 {
+            token_client.transfer(&env.current_contract_address(), &target, &net_amount);
+        }
+        increment_accrued_fees(&env, &asset, fee);
+        increment_total_bridged(&env, &asset, net_amount);
+        increment_total_fees_collected(&env, &asset, fee);
+
+        env.events().publish(
+            ("CrossChainFunded", target),
+            (chain_id, tx_hash, amount, fee, asset),
+        );
+        Ok(())
+    }
+
+    pub fn add_relayer(env: Env, pubkey: BytesN<32>) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        read_admin(&env).require_auth();
+        add_relayer(&env, &pubkey);
+        Ok(())
+    }
+
+    pub fn remove_relayer(env: Env, pubkey: BytesN<32>) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        read_admin(&env).require_auth();
+        // Prevent removing below threshold
+        let new_count = relayer_count(&env).saturating_sub(1);
+        if new_count < relayer_threshold(&env) {
+            return Err(BridgeError::BelowThreshold);
+        }
+        remove_relayer(&env, &pubkey);
+        Ok(())
+    }
+
+    pub fn set_relayer_threshold(env: Env, threshold: u32) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        read_admin(&env).require_auth();
+        if threshold > relayer_count(&env) {
+            return Err(BridgeError::ThresholdExceedsRelayers);
+        }
+        save_relayer_threshold(&env, threshold);
+        Ok(())
+    }
+
+    pub fn query_relayer_threshold(env: Env) -> Result<u32, BridgeError> {
+        check_initialized(&env)?;
+        Ok(relayer_threshold(&env))
+    }
+
+    pub fn query_is_relayer(env: Env, pubkey: BytesN<32>) -> Result<bool, BridgeError> {
+        check_initialized(&env)?;
+        Ok(is_relayer(&env, &pubkey))
     }
 
     // --- Timelocked Funding ---

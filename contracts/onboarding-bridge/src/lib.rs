@@ -47,6 +47,26 @@ pub enum DataKey {
 
 const MAX_FEE_BPS: u32 = 1_000;
 const FEE_DENOMINATOR: i128 = 10_000;
+const MAX_BATCH_SIZE: u32 = 100;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelayerSig {
+    pub pubkey: BytesN<32>,
+    pub signature: BytesN<64>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelockEntry {
+    pub source: Address,
+    pub target: Address,
+    pub asset: Address,
+    pub amount: i128,
+    pub release_time: u64,
+    pub cliff_time: u64,
+    pub claimed: bool,
+}
 
 fn save_admin(env: &Env, admin: &Address) {
     env.storage().instance().set(&DataKey::Admin, admin);

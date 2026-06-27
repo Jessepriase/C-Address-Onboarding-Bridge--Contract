@@ -4,6 +4,18 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Map, Vec,
 };
 
+#[cfg(target_family = "wasm")]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    core::arch::wasm32::unreachable()
+}
+
+#[cfg(target_family = "wasm")]
+#[alloc_error_handler]
+fn alloc_error(_: core::alloc::Layout) -> ! {
+    core::arch::wasm32::unreachable()
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum BridgeError {
@@ -45,18 +57,22 @@ pub enum DataKey {
 const MAX_FEE_BPS: u32 = 1_000;
 const FEE_DENOMINATOR: i128 = 10_000;
 
+#[inline(never)]
 fn save_admin(env: &Env, admin: &Address) {
     env.storage().instance().set(&DataKey::Admin, admin);
 }
 
+#[inline(never)]
 fn read_admin(env: &Env) -> Address {
     env.storage().instance().get(&DataKey::Admin).unwrap()
 }
 
+#[inline(never)]
 fn save_fee_collector(env: &Env, addr: &Address) {
     env.storage().instance().set(&DataKey::FeeCollector, addr);
 }
 
+#[inline(never)]
 fn read_fee_collector(env: &Env) -> Address {
     env.storage()
         .instance()
@@ -64,6 +80,7 @@ fn read_fee_collector(env: &Env) -> Address {
         .unwrap()
 }
 
+#[inline(never)]
 fn save_fee_bps(env: &Env, fee_bps: &u32) {
     env.storage().instance().set(&DataKey::FeeBps, fee_bps);
 }
@@ -80,10 +97,12 @@ fn mark_initialized(env: &Env) {
     env.storage().instance().set(&DataKey::Initialized, &true);
 }
 
+#[inline(never)]
 fn save_minimum_amount(env: &Env, amount: &i128) {
     let _ = (env, amount); // Unused - planned for future  
 }
 
+#[inline(never)]
 fn read_minimum_amount(env: &Env) -> i128 {
     let _ = env; // Unused - planned for future
     0
@@ -145,6 +164,7 @@ fn check_access(env: &Env, target: &Address) -> Result<(), BridgeError> {
     Ok(())
 }
 
+#[inline(never)]
 fn read_whitelist(env: &Env) -> Map<Address, bool> {
     env.storage()
         .instance()
@@ -152,6 +172,7 @@ fn read_whitelist(env: &Env) -> Map<Address, bool> {
         .unwrap_or_else(|| Map::new(env))
 }
 
+#[inline(never)]
 fn save_whitelist(env: &Env, whitelist: &Map<Address, bool>) {
     env.storage()
         .instance()

@@ -34,6 +34,17 @@ pub enum BridgeError {
     DuplicateNonce = 12,
     TransactionExpired = 13,
     LoyaltyTokenNotSet = 14,
+    ReplayedNonce = 15,
+    NotRelayer = 16,
+    BelowThreshold = 17,
+    ThresholdExceedsRelayers = 18,
+    TimelockNotFound = 19,
+    TimelockNotMatured = 20,
+    InvalidReleaseTime = 21,
+    Unauthorized = 22,
+    // Issue #95: replay protection for Soroban authorization entries
+    AuthNonceAlreadyUsed = 23,
+    AuthNonceExpired = 24,
 }
 
 #[contracttype]
@@ -54,11 +65,73 @@ pub enum DataKey {
     AssetFeeCap(Address),
     Nonce(Address),
     ReferralRate,
+    // Extended variants used throughout the contract
+    Config,
+    AssetStats(Address),
+    Relayer(BytesN<32>),
+    RelayerCount,
+    RelayerThreshold,
+    CrossChainNonce(BytesN<32>),
+    DailyUsage(Address, Address, u64),
+    FeeTiers,
+    SourceBridgedVolume(Address),
+    LoyaltyToken,
+    LoyaltyAmountPerFund,
+    TimelockId,
+    Timelock(u64),
+    UserDeposit(Address, Address),
+    MaxInstanceTtl,
+    MaxPersistentTtl,
+    BridgeConfig,
+    // Issue #95: per-address auth nonce counter and used-nonce set
+    AuthNonce(Address),
+    UsedAuthNonce(Address, u64),
 }
 
 const MAX_FEE_BPS: u32 = 1_000;
 const FEE_DENOMINATOR: i128 = 10_000;
 const MAX_BATCH_SIZE: u32 = 100;
+const MAX_ALLOWED_TTL: u32 = 3_110_400; // ~1 year in ledgers (5s/ledger)
+const CRITICAL_ENTRY_TTL_THRESHOLD: u32 = 100_000;
+
+// --- Packed BridgeConfig struct (fee_bps + paused + allowlist_mode) ---
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BridgeConfig {
+    pub fee_bps: u32,
+    pub paused: bool,
+    pub allowlist_mode: bool,
+}
+
+// BridgeConfigData: admin + fee_collector + fee_bps snapshot (used in initialize)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BridgeConfigData {
+    pub admin: Address,
+    pub fee_collector: Address,
+    pub fee_bps: u32,
+}
+
+// --- Asset counters ---
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetCounters {
+    pub accrued_fees: i128,
+    pub total_bridged: i128,
+    pub total_fees_collected: i128,
+}
+
+// --- Fee tier ---
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeTier {
+    pub min_volume: i128,
+    pub max_volume: i128,
+    pub fee_bps: u32,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,6 +150,73 @@ pub struct TimelockEntry {
     pub release_time: u64,
     pub cliff_time: u64,
     pub claimed: bool,
+}
+
+fn read_bridge_config(env: &Env) -> BridgeConfigData {
+    env.storage()
+        .instance()
+        .get(&DataKey::BridgeConfig)
+        .unwrap_or(BridgeConfigData {
+            admin: read_admin(env),
+            fee_collector: read_fee_collector(env),
+            fee_bps: read_fee_bps(env),
+        })
+}
+
+fn save_bridge_config(env: &Env, cfg: &BridgeConfigData) {
+    env.storage()
+        .instance()
+        .set(&DataKey::BridgeConfig, cfg);
+}
+
+fn read_max_instance_ttl(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MaxInstanceTtl)
+        .unwrap_or(MAX_ALLOWED_TTL)
+}
+
+fn read_max_persistent_ttl(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MaxPersistentTtl)
+        .unwrap_or(MAX_ALLOWED_TTL)
+}
+
+fn extend_instance_ttl(env: &Env) {
+    let max_ttl = read_max_instance_ttl(env);
+    let threshold = max_ttl / 4;
+    env.storage().instance().extend_ttl(threshold, max_ttl);
+}
+
+fn next_timelock_id(env: &Env) -> u64 {
+    let id: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::TimelockId)
+        .unwrap_or(0u64);
+    env.storage()
+        .instance()
+        .set(&DataKey::TimelockId, &(id + 1));
+    id
+}
+
+fn save_timelock_entry(env: &Env, id: u64, entry: &TimelockEntry) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::Timelock(id), entry);
+}
+
+fn read_timelock_entry(env: &Env, id: u64) -> Option<TimelockEntry> {
+    env.storage().persistent().get(&DataKey::Timelock(id))
+}
+
+fn increment_user_deposit(env: &Env, source: &Address, asset: &Address, amount: i128) {
+    let key = DataKey::UserDeposit(source.clone(), asset.clone());
+    let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+    env.storage()
+        .persistent()
+        .set(&key, &(current + amount));
 }
 
 #[inline(never)]
@@ -343,6 +483,83 @@ fn consume_nonce(env: &Env, caller: &Address, nonce: Option<u64>) -> Result<(), 
             .persistent()
             .set(&DataKey::Nonce(caller.clone()), &(stored + 1));
     }
+    Ok(())
+}
+
+// --- Issue #95: Replay protection for Soroban authorization entries ---
+//
+// An "auth nonce" is a monotonically increasing u64 counter per source address.
+// A caller commits to a specific nonce **and** a ledger-sequence window
+// [valid_after_ledger, valid_before_ledger).  The contract:
+//   1. Binds the nonce to the current contract ID (implicitly — stored under this
+//      contract's own persistent storage, keyed by source address).
+//   2. Checks that the current ledger sequence is within the caller-supplied window.
+//   3. Records the (source, nonce) pair as used, preventing replay in any future
+//      transaction regardless of ledger sequence.
+//   4. Emits `AuthUsed(source, nonce)` so off-chain indexers can track usage.
+
+fn read_auth_nonce(env: &Env, source: &Address) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::AuthNonce(source.clone()))
+        .unwrap_or(0)
+}
+
+fn is_auth_nonce_used(env: &Env, source: &Address, nonce: u64) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::UsedAuthNonce(source.clone(), nonce))
+        .unwrap_or(false)
+}
+
+fn mark_auth_nonce_used(env: &Env, source: &Address, nonce: u64) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::UsedAuthNonce(source.clone(), nonce), &true);
+    // Advance the per-address counter so clients can always discover the next
+    // expected nonce without scanning storage.
+    let current = read_auth_nonce(env, source);
+    if nonce >= current {
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuthNonce(source.clone()), &(nonce + 1));
+    }
+}
+
+/// Validate and consume a Soroban authorization-entry nonce.
+///
+/// Parameters
+/// - `source`              : address whose auth entry is being validated
+/// - `nonce`               : caller-supplied nonce (must not have been used before)
+/// - `valid_after_ledger`  : inclusive lower bound on `env.ledger().sequence()`
+/// - `valid_before_ledger` : exclusive upper bound on `env.ledger().sequence()`
+///
+/// On success the nonce is marked used and `AuthUsed(source, nonce)` is emitted.
+fn consume_auth_nonce(
+    env: &Env,
+    source: &Address,
+    nonce: u64,
+    valid_after_ledger: u32,
+    valid_before_ledger: u32,
+) -> Result<(), BridgeError> {
+    // 1. Ledger-sequence window check (guards against stale / premature replays)
+    let seq = env.ledger().sequence();
+    if seq < valid_after_ledger || seq >= valid_before_ledger {
+        return Err(BridgeError::AuthNonceExpired);
+    }
+
+    // 2. Used-nonce check (prevents exact replay of this (source, nonce) pair)
+    if is_auth_nonce_used(env, source, nonce) {
+        return Err(BridgeError::AuthNonceAlreadyUsed);
+    }
+
+    // 3. Mark as used and advance the per-address counter
+    mark_auth_nonce_used(env, source, nonce);
+
+    // 4. Emit AuthUsed event for off-chain indexers
+    env.events()
+        .publish(("AuthUsed", source.clone()), (nonce,));
+
     Ok(())
 }
 
@@ -1315,8 +1532,24 @@ impl OnboardingBridge {
 
         // Build payload hash = sha256(chain_id_be4 || tx_hash || target_bytes ||
         //                              asset_bytes || amount_be16 || nonce)
-        let target_bytes = target.clone().to_xdr(&env);
-        let asset_bytes = asset.clone().to_xdr(&env);
+        // Note: soroban-sdk 22 does not expose Address::to_xdr.
+        // We represent each address as a sha256 hash of its strkey bytes so the
+        // payload is still domain-separated and collision-resistant.
+        let target_strkey = target.clone().to_string();
+        let asset_strkey = asset.clone().to_string();
+        let mut addr_buf = [0u8; 64];
+
+        let tlen = target_strkey.len() as usize;
+        target_strkey.copy_into_slice(&mut addr_buf[..tlen]);
+        let target_raw = soroban_sdk::Bytes::from_slice(&env, &addr_buf[..tlen]);
+        let target_hash: BytesN<32> = env.crypto().sha256(&target_raw).into();
+        let target_bytes: soroban_sdk::Bytes = target_hash.into();
+
+        let alen = asset_strkey.len() as usize;
+        asset_strkey.copy_into_slice(&mut addr_buf[..alen]);
+        let asset_raw = soroban_sdk::Bytes::from_slice(&env, &addr_buf[..alen]);
+        let asset_hash: BytesN<32> = env.crypto().sha256(&asset_raw).into();
+        let asset_bytes: soroban_sdk::Bytes = asset_hash.into();
         let nonce_bytes: soroban_sdk::Bytes = nonce.clone().into();
 
         let mut payload: soroban_sdk::Bytes = soroban_sdk::Bytes::new(&env);
@@ -1586,6 +1819,48 @@ impl OnboardingBridge {
             MAX_ALLOWED_TTL,
             CRITICAL_ENTRY_TTL_THRESHOLD,
         ))
+    }
+
+    // --- Issue #95: Replay protection for Soroban authorization entries ---
+
+    /// Validate and consume a Soroban authorization-entry nonce.
+    ///
+    /// This prevents signature / authorization-entry reuse attacks by:
+    /// - Binding the nonce to this contract's own storage (contract ID scoping is
+    ///   implicit — nonces live in this contract's persistent storage).
+    /// - Enforcing a ledger-sequence window so stale entries cannot be replayed.
+    /// - Recording the `(source, nonce)` pair as permanently used.
+    /// - Emitting an `AuthUsed(source, nonce)` event for off-chain tracking.
+    ///
+    /// Parameters
+    /// - `source`              : the address whose authorization entry is being consumed
+    /// - `nonce`               : the caller-supplied nonce (must be unused)
+    /// - `valid_after_ledger`  : inclusive lower bound on the current ledger sequence
+    /// - `valid_before_ledger` : exclusive upper bound on the current ledger sequence
+    pub fn verify_auth_entry(
+        env: Env,
+        source: Address,
+        nonce: u64,
+        valid_after_ledger: u32,
+        valid_before_ledger: u32,
+    ) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        source.require_auth();
+        consume_auth_nonce(&env, &source, nonce, valid_after_ledger, valid_before_ledger)
+    }
+
+    /// Query the next expected auth nonce for `source`.
+    ///
+    /// Returns the lowest nonce value that has not yet been used for `source`.
+    /// Callers should use this value when constructing a new authorization entry.
+    pub fn query_auth_nonce(env: Env, source: Address) -> u64 {
+        read_auth_nonce(&env, &source)
+    }
+
+    /// Query whether a specific auth nonce has already been used for `source`.
+    pub fn query_auth_nonce_used(env: Env, source: Address, nonce: u64) -> bool {
+        is_auth_nonce_used(&env, &source, nonce)
     }
 }
 

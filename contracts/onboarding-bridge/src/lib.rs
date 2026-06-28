@@ -45,10 +45,6 @@ pub enum BridgeError {
     // Issue #95: replay protection for Soroban authorization entries
     AuthNonceAlreadyUsed = 23,
     AuthNonceExpired = 24,
-    // Issue #72: contract upgrade / timelock
-    UpgradeNotScheduled = 25,
-    UpgradeTimelockActive = 26,
-    UpgradeHashMismatch = 27,
 }
 
 #[contracttype]
@@ -90,9 +86,6 @@ pub enum DataKey {
     // Issue #95: per-address auth nonce counter and used-nonce set
     AuthNonce(Address),
     UsedAuthNonce(Address, u64),
-    // Issue #72: contract upgrade timelock storage
-    PendingUpgrade,
-    CurrentWasmHash,
 }
 
 const MAX_FEE_BPS: u32 = 1_000;
@@ -128,19 +121,6 @@ pub struct AssetCounters {
     pub accrued_fees: i128,
     pub total_bridged: i128,
     pub total_fees_collected: i128,
-}
-
-/// Minimum timelock delay (in ledgers) for a scheduled upgrade — ~24 hours at 5 s/ledger.
-const UPGRADE_TIMELOCK_LEDGERS: u32 = 17_280;
-
-/// Stores an admin-scheduled WASM upgrade that is pending timelock expiry.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PendingUpgrade {
-    /// The new WASM hash to apply once the timelock elapses.
-    pub new_wasm_hash: BytesN<32>,
-    /// Ledger sequence number after which `execute_upgrade` may be called.
-    pub executable_after_ledger: u32,
 }
 
 // --- Fee tier ---
@@ -207,32 +187,6 @@ fn extend_instance_ttl(env: &Env) {
     let max_ttl = read_max_instance_ttl(env);
     let threshold = max_ttl / 4;
     env.storage().instance().extend_ttl(threshold, max_ttl);
-}
-
-// --- Issue #72: upgrade timelock helpers ---
-
-fn save_current_wasm_hash(env: &Env, hash: &BytesN<32>) {
-    env.storage()
-        .instance()
-        .set(&DataKey::CurrentWasmHash, hash);
-}
-
-fn read_current_wasm_hash(env: &Env) -> Option<BytesN<32>> {
-    env.storage().instance().get(&DataKey::CurrentWasmHash)
-}
-
-fn save_pending_upgrade(env: &Env, pending: &PendingUpgrade) {
-    env.storage()
-        .instance()
-        .set(&DataKey::PendingUpgrade, pending);
-}
-
-fn read_pending_upgrade(env: &Env) -> Option<PendingUpgrade> {
-    env.storage().instance().get(&DataKey::PendingUpgrade)
-}
-
-fn clear_pending_upgrade(env: &Env) {
-    env.storage().instance().remove(&DataKey::PendingUpgrade);
 }
 
 fn next_timelock_id(env: &Env) -> u64 {

@@ -45,6 +45,10 @@ pub enum BridgeError {
     // Issue #95: replay protection for Soroban authorization entries
     AuthNonceAlreadyUsed = 23,
     AuthNonceExpired = 24,
+    // Issue #72: contract upgrade / timelock
+    UpgradeNotScheduled = 25,
+    UpgradeTimelockActive = 26,
+    UpgradeHashMismatch = 27,
 }
 
 #[contracttype]
@@ -86,6 +90,9 @@ pub enum DataKey {
     // Issue #95: per-address auth nonce counter and used-nonce set
     AuthNonce(Address),
     UsedAuthNonce(Address, u64),
+    // Issue #72: contract upgrade timelock storage
+    PendingUpgrade,
+    CurrentWasmHash,
 }
 
 const MAX_FEE_BPS: u32 = 1_000;
@@ -121,6 +128,19 @@ pub struct AssetCounters {
     pub accrued_fees: i128,
     pub total_bridged: i128,
     pub total_fees_collected: i128,
+}
+
+/// Minimum timelock delay (in ledgers) for a scheduled upgrade — ~24 hours at 5 s/ledger.
+const UPGRADE_TIMELOCK_LEDGERS: u32 = 17_280;
+
+/// Stores an admin-scheduled WASM upgrade that is pending timelock expiry.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingUpgrade {
+    /// The new WASM hash to apply once the timelock elapses.
+    pub new_wasm_hash: BytesN<32>,
+    /// Ledger sequence number after which `execute_upgrade` may be called.
+    pub executable_after_ledger: u32,
 }
 
 // --- Fee tier ---
@@ -187,6 +207,32 @@ fn extend_instance_ttl(env: &Env) {
     let max_ttl = read_max_instance_ttl(env);
     let threshold = max_ttl / 4;
     env.storage().instance().extend_ttl(threshold, max_ttl);
+}
+
+// --- Issue #72: upgrade timelock helpers ---
+
+fn save_current_wasm_hash(env: &Env, hash: &BytesN<32>) {
+    env.storage()
+        .instance()
+        .set(&DataKey::CurrentWasmHash, hash);
+}
+
+fn read_current_wasm_hash(env: &Env) -> Option<BytesN<32>> {
+    env.storage().instance().get(&DataKey::CurrentWasmHash)
+}
+
+fn save_pending_upgrade(env: &Env, pending: &PendingUpgrade) {
+    env.storage()
+        .instance()
+        .set(&DataKey::PendingUpgrade, pending);
+}
+
+fn read_pending_upgrade(env: &Env) -> Option<PendingUpgrade> {
+    env.storage().instance().get(&DataKey::PendingUpgrade)
+}
+
+fn clear_pending_upgrade(env: &Env) {
+    env.storage().instance().remove(&DataKey::PendingUpgrade);
 }
 
 fn next_timelock_id(env: &Env) -> u64 {
@@ -1280,10 +1326,129 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
+
+        // Record the hash we are replacing so the event contains both sides.
+        let old_hash = read_current_wasm_hash(&env);
+
         env.deployer()
             .update_current_contract_wasm(new_wasm_hash.clone());
-        env.events().publish(("Upgraded",), (admin, new_wasm_hash));
+
+        // Store the new hash as the authoritative "current" hash.
+        save_current_wasm_hash(&env, &new_wasm_hash);
+
+        // Emit ContractUpgraded(old_hash, new_hash) as required by issue #72.
+        env.events().publish(
+            ("ContractUpgraded",),
+            (old_hash, new_wasm_hash, admin),
+        );
         Ok(())
+    }
+
+    // --- Issue #72: timelocked upgrade path ---
+
+    /// Schedule a WASM upgrade that becomes executable after a timelock delay.
+    ///
+    /// The upgrade will only be executable once
+    /// `env.ledger().sequence() >= current_sequence + UPGRADE_TIMELOCK_LEDGERS`
+    /// (~24 hours at 5 s/ledger).
+    ///
+    /// Only one upgrade may be pending at a time. Call `cancel_upgrade` first
+    /// to replace a pending upgrade.
+    pub fn schedule_upgrade(
+        env: Env,
+        new_wasm_hash: BytesN<32>,
+        nonce: Option<u64>,
+    ) -> Result<u32, BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+
+        let executable_after_ledger = env
+            .ledger()
+            .sequence()
+            .saturating_add(UPGRADE_TIMELOCK_LEDGERS);
+
+        let pending = PendingUpgrade {
+            new_wasm_hash: new_wasm_hash.clone(),
+            executable_after_ledger,
+        };
+        save_pending_upgrade(&env, &pending);
+
+        env.events().publish(
+            ("UpgradeScheduled",),
+            (new_wasm_hash, executable_after_ledger, admin),
+        );
+        Ok(executable_after_ledger)
+    }
+
+    /// Execute a previously scheduled upgrade once its timelock has elapsed.
+    ///
+    /// `expected_hash` must match the hash that was scheduled — this prevents
+    /// a race where the admin changes the pending hash between scheduling and
+    /// execution.
+    pub fn execute_upgrade(
+        env: Env,
+        expected_hash: BytesN<32>,
+        nonce: Option<u64>,
+    ) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+
+        let pending = read_pending_upgrade(&env)
+            .ok_or(BridgeError::UpgradeNotScheduled)?;
+
+        // Guard against hash substitution between schedule and execute.
+        if pending.new_wasm_hash != expected_hash {
+            return Err(BridgeError::UpgradeHashMismatch);
+        }
+
+        // Enforce the timelock.
+        if env.ledger().sequence() < pending.executable_after_ledger {
+            return Err(BridgeError::UpgradeTimelockActive);
+        }
+
+        let old_hash = read_current_wasm_hash(&env);
+
+        // Clear before upgrading so any re-entrant call cannot replay.
+        clear_pending_upgrade(&env);
+
+        env.deployer()
+            .update_current_contract_wasm(pending.new_wasm_hash.clone());
+
+        save_current_wasm_hash(&env, &pending.new_wasm_hash);
+
+        env.events().publish(
+            ("ContractUpgraded",),
+            (old_hash, pending.new_wasm_hash, admin),
+        );
+        Ok(())
+    }
+
+    /// Cancel a pending scheduled upgrade. Only callable by admin.
+    pub fn cancel_upgrade(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+
+        let pending = read_pending_upgrade(&env)
+            .ok_or(BridgeError::UpgradeNotScheduled)?;
+
+        clear_pending_upgrade(&env);
+
+        env.events().publish(
+            ("UpgradeCancelled",),
+            (pending.new_wasm_hash, admin),
+        );
+        Ok(())
+    }
+
+    /// Query the pending scheduled upgrade, if any.
+    pub fn query_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
+        read_pending_upgrade(&env)
     }
 
     // --- Blocklist / Allowlist ---
